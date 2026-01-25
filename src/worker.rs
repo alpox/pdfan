@@ -44,7 +44,7 @@ where
     pub fn new<F, Fut>(cap: usize, workers: usize, make_ctx: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + Clone + 'static,
-        Fut: Future<Output = Ctx> + Send + 'static,
+        Fut: Future<Output = Result<Ctx>> + Send + 'static,
     {
         let semaphore = Arc::new(Semaphore::new(cap));
         let (tx, rx) = async_channel::unbounded();
@@ -85,9 +85,9 @@ async fn spawn_worker<T, Ctx, F, Fut>(rx: async_channel::Receiver<Packet<Ctx, T>
 where
     T: Task<Ctx>,
     F: Fn() -> Fut,
-    Fut: Future<Output = Ctx>,
+    Fut: Future<Output = Result<Ctx>>,
 {
-    let mut ctx = make_ctx().await;
+    let mut ctx = make_ctx().await.unwrap();
 
     while let Ok(packet) = rx.recv().await {
         if packet.tx.is_closed() {
