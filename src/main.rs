@@ -16,9 +16,6 @@
 use fantoccini::{ClientBuilder, Locator, wd::PrintConfiguration};
 use serde::{Deserialize, Serialize};
 
-use crate::driver::{ChromeDriver, Supervisor};
-
-pub mod driver;
 pub mod worker;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -63,9 +60,6 @@ enum PdfPayload {
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    let supervisor = Supervisor::new();
-    supervisor.run(ChromeDriver);
-
     let c = ClientBuilder::native()
         .connect("http://localhost:4444")
         .await
@@ -89,8 +83,6 @@ async fn main() -> color_eyre::Result<()> {
     assert_eq!(url.as_ref(), "https://en.wikipedia.org/wiki/Foo_Lake");
 
     c.close().await?;
-
-    supervisor.stop().await;
 
     Ok(())
 }
