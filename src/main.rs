@@ -2,32 +2,17 @@ use color_eyre::eyre::Result;
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::post,
 };
-
-use serde::{Deserialize, Serialize};
 
 use crate::chrome::{ChromeDriver, ChromeDriverPdfPayload, PdfDriver};
 
 pub mod chrome;
 pub mod worker;
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TypstDriverPdfPayload {
-    content: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", untagged)]
-enum PdfPayload {
-    ChromeDriver(Box<ChromeDriverPdfPayload>),
-    Typst(Box<TypstDriverPdfPayload>),
-}
 
 struct AppError(color_eyre::eyre::Error);
 
@@ -44,19 +29,31 @@ impl<E: Into<color_eyre::eyre::Error>> From<E> for AppError {
 }
 
 #[tokio::main]
-async fn main() {
-    let chrome_driver = Arc::new(ChromeDriver::new(Duration::from_secs(30)));
+async fn main() -> Result<()> {
+    color_eyre::install()?;
+
+    let chrome_driver = Arc::new(
+        ChromeDriver::new(Duration::from_secs(30))
+            .await
+            .expect("Failed to initialize Chrome driver"),
+    );
 
     // build our application with a single route
     let app = Router::new()
-        .route("/", get(handle_pdf))
+        .route("/api/convert", post(handle_pdf))
         .with_state(chrome_driver);
 
     // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    println!("Listening on port 3000");
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
-async fn handle_pdf(State(driver): State<Arc<ChromeDriver>>) -> Result<Vec<u8>, AppError> {
-    Ok(driver.pdf(ChromeDriverPdfPayload::default()).await?)
+async fn handle_pdf(
+    State(driver): State<Arc<ChromeDriver>>,
+    Json(payload): Json<ChromeDriverPdfPayload>,
+) -> Result<Vec<u8>, AppError> {
+    Ok(driver.pdf(payload).await?)
 }

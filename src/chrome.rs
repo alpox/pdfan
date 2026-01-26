@@ -1,45 +1,17 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use base64::prelude::*;
-use color_eyre::eyre::{eyre, Context, Result};
-use fantoccini::{Client, ClientBuilder, wd::{Capabilities, WebDriverCompatibleCommand}};
-use http::Method;
+use chromiumoxide::{
+    Page,
+    browser::{Browser, BrowserConfig},
+    cdp::browser_protocol::page::PrintToPdfParams,
+};
+use color_eyre::eyre::{Context, Result, eyre};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use tokio::task::JoinHandle;
 
 use crate::worker::{Task, WorkerPool};
-
-/// A CDP command that can be issued through fantoccini's WebDriver connection.
-#[derive(Debug)]
-struct CdpCommand {
-    cmd: String,
-    params: Value,
-}
-
-impl CdpCommand {
-    fn new(cmd: impl Into<String>, params: Value) -> Self {
-        Self { cmd: cmd.into(), params }
-    }
-}
-
-impl WebDriverCompatibleCommand for CdpCommand {
-    fn endpoint(
-        &self,
-        base_url: &url::Url,
-        session_id: Option<&str>,
-    ) -> std::result::Result<url::Url, url::ParseError> {
-        base_url.join(&format!("session/{}/goog/cdp/execute", session_id.unwrap()))
-    }
-
-    fn method_and_body(&self, _request_url: &url::Url) -> (Method, Option<String>) {
-        let body = json!({ "cmd": &self.cmd, "params": &self.params });
-        (Method::POST, Some(body.to_string()))
-    }
-
-    fn is_new_session(&self) -> bool {
-        false
-    }
-}
 
 fn format_to_inches(format: &str) -> (f64, f64) {
     match format.to_uppercase().as_str() {
@@ -70,16 +42,20 @@ pub struct ChromeDriverPdfPayload {
     width: Option<String>,
     height: Option<String>,
     print_range: Option<String>,
+    #[serde(default)]
     print_background: bool,
+    #[serde(default)]
     landscape: bool,
     margin_top: Option<f64>,
     margin_right: Option<f64>,
     margin_bottom: Option<f64>,
     margin_left: Option<f64>,
+    #[serde(default)]
     display_header_footer: bool,
     header_template: Option<String>,
     footer_template: Option<String>,
     wait_for_resources: Option<bool>,
+    #[serde(default)]
     wait_for_event: bool,
 }
 
@@ -88,8 +64,73 @@ pub trait PdfDriver {
     async fn pdf(&self, payload: Self::Payload) -> Result<Vec<u8>>;
 }
 
-struct ChromeTaskCtx {
-    client: Client,
+/// Shared browser instance with its handler task
+struct SharedBrowser {
+    browser: Arc<Browser>,
+    _handler_handle: JoinHandle<()>,
+}
+
+impl SharedBrowser {
+    async fn launch() -> Result<Self> {
+        let config = BrowserConfig::builder()
+            .arg("--headless")
+            .arg("--no-sandbox")
+            .arg("--disable-gpu")
+            .arg("--disable-dev-shm-usage")
+            .build()
+            .map_err(|e| eyre!("Failed to build browser config: {}", e))?;
+
+        let (browser, mut handler) = Browser::launch(config)
+            .await
+            .wrap_err("Failed to launch browser")?;
+
+        // Spawn handler task - must run continuously for CDP communication
+        let handler_handle = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if let Err(e) = event {
+                    eprintln!("Browser handler error: {:?}", e);
+                }
+            }
+        });
+
+        Ok(Self {
+            browser: Arc::new(browser),
+            _handler_handle: handler_handle,
+        })
+    }
+
+    fn browser(&self) -> Arc<Browser> {
+        Arc::clone(&self.browser)
+    }
+}
+
+/// Worker context holding a reusable page
+pub struct ChromeTaskCtx {
+    browser: Arc<Browser>,
+    page: Page,
+}
+
+impl ChromeTaskCtx {
+    async fn new(browser: Arc<Browser>) -> Result<Self> {
+        let page = browser
+            .new_page("about:blank")
+            .await
+            .wrap_err("Failed to create new page")?;
+
+        Ok(Self { browser, page })
+    }
+
+    /// Recreate the page if it becomes unusable
+    async fn recreate_page(&mut self) -> Result<()> {
+        // Create fresh page (old page will be dropped, which closes it)
+        self.page = self
+            .browser
+            .new_page("about:blank")
+            .await
+            .wrap_err("Failed to recreate page")?;
+
+        Ok(())
+    }
 }
 
 struct ChromeTask {
@@ -100,102 +141,110 @@ impl ChromeTask {
     pub fn new(payload: ChromeDriverPdfPayload) -> Self {
         Self { payload }
     }
+
+    async fn process_inner(&self, ctx: &mut ChromeTaskCtx) -> Result<Vec<u8>> {
+        let p = &self.payload;
+
+        // Load content - set_content for HTML (fast!), goto for URLs
+        if let Some(html) = &p.html {
+            ctx.page
+                .set_content(html)
+                .await
+                .wrap_err("Failed to set HTML content")?;
+        } else if let Some(url) = &p.url {
+            ctx.page
+                .goto(url)
+                .await
+                .wrap_err("Failed to navigate to URL")?;
+        } else {
+            return Err(eyre!("Either url or html must be provided"));
+        }
+
+        // Build PDF parameters
+        let display_header_footer = p.header_template.is_some() || p.footer_template.is_some();
+
+        let mut pdf_params = PrintToPdfParams::builder()
+            .print_background(p.print_background)
+            .landscape(p.landscape)
+            .display_header_footer(display_header_footer)
+            .margin_top(p.margin_top.unwrap_or(0.0))
+            .margin_right(p.margin_right.unwrap_or(0.0))
+            .margin_bottom(p.margin_bottom.unwrap_or(0.0))
+            .margin_left(p.margin_left.unwrap_or(0.0));
+
+        // Handle dimensions
+        if let (Some(_w), Some(_h)) = (&p.width, &p.height) {
+            // TODO: Parse width/height strings to f64 if they include units
+            // For now, use format-based dimensions
+            let (w, h) = format_to_inches(p.format.as_deref().unwrap_or("A4"));
+            pdf_params = pdf_params.paper_width(w).paper_height(h);
+        } else {
+            let (w, h) = format_to_inches(p.format.as_deref().unwrap_or("A4"));
+            pdf_params = pdf_params.paper_width(w).paper_height(h);
+        }
+
+        // Optional fields
+        if let Some(ranges) = &p.print_range {
+            pdf_params = pdf_params.page_ranges(ranges.clone());
+        }
+        if let Some(header) = &p.header_template {
+            pdf_params = pdf_params.header_template(header.clone());
+        }
+        if let Some(footer) = &p.footer_template {
+            pdf_params = pdf_params.footer_template(footer.clone());
+        }
+
+        // Generate PDF
+        let pdf_bytes = ctx
+            .page
+            .pdf(pdf_params.build())
+            .await
+            .wrap_err("Failed to generate PDF")?;
+
+        Ok(pdf_bytes)
+    }
 }
 
 impl Task<ChromeTaskCtx> for ChromeTask {
     type Result = Result<Vec<u8>>;
 
     async fn process(&self, ctx: &mut ChromeTaskCtx) -> Self::Result {
-        let c = &ctx.client;
-        let p = &self.payload;
-
-        // Navigate to URL or load HTML via data URL
-        if let Some(url) = &p.url {
-            c.goto(url).await?;
-        } else if let Some(html) = &p.html {
-            let encoded = BASE64_STANDARD.encode(html);
-            c.goto(&format!("data:text/html;base64,{encoded}")).await?;
+        match self.process_inner(ctx).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Attempt recovery by recreating page
+                if ctx.recreate_page().await.is_ok() {
+                    // Retry once with fresh page
+                    self.process_inner(ctx).await
+                } else {
+                    Err(e)
+                }
+            }
         }
-
-        // Determine if we should display header/footer (matches TypeScript logic)
-        let display_header_footer = p.header_template.is_some() || p.footer_template.is_some();
-
-        // Build CDP params matching the TypeScript implementation
-        let mut params = json!({
-            "printBackground": p.print_background,
-            "landscape": p.landscape,
-            "displayHeaderFooter": display_header_footer,
-            "marginTop": p.margin_top.unwrap_or(0.0),
-            "marginRight": p.margin_right.unwrap_or(0.0),
-            "marginBottom": p.margin_bottom.unwrap_or(0.0),
-            "marginLeft": p.margin_left.unwrap_or(0.0),
-        });
-
-        // Add optional fields
-        if let Some(ranges) = &p.print_range {
-            params["pageRanges"] = json!(ranges);
-        }
-        if let Some(header) = &p.header_template {
-            params["headerTemplate"] = json!(header);
-        }
-        if let Some(footer) = &p.footer_template {
-            params["footerTemplate"] = json!(footer);
-        }
-
-        // Handle dimensions: use width/height if both provided, otherwise use format
-        if let (Some(w), Some(h)) = (&p.width, &p.height) {
-            params["paperWidth"] = json!(w);
-            params["paperHeight"] = json!(h);
-        } else {
-            let (w, h) = format_to_inches(p.format.as_deref().unwrap_or("A4"));
-            params["paperWidth"] = json!(w);
-            params["paperHeight"] = json!(h);
-        }
-
-        // Execute CDP command
-        let result = c
-            .issue_cmd(CdpCommand::new("Page.printToPDF", params))
-            .await
-            .wrap_err("failed to execute Page.printToPDF")?;
-
-        // Decode base64 PDF data from response
-        let pdf_base64 = result["data"]
-            .as_str()
-            .ok_or_else(|| eyre!("No PDF data in response"))?;
-
-        BASE64_STANDARD
-            .decode(pdf_base64)
-            .wrap_err("failed to decode PDF base64")
     }
 }
 
 pub struct ChromeDriver {
     pool: WorkerPool<ChromeTaskCtx, ChromeTask>,
+    _shared_browser: SharedBrowser,
     task_timeout: Duration,
 }
 
 impl ChromeDriver {
-    pub fn new(task_timeout: Duration) -> Self {
-        let pool = WorkerPool::new(30, 10, || async {
-            let mut caps = Capabilities::new();
+    pub async fn new(task_timeout: Duration) -> Result<Self> {
+        let shared_browser = SharedBrowser::launch().await?;
+        let browser = shared_browser.browser();
 
-            caps.insert(
-                "goog:chromeOptions".to_string(),
-                json!({
-                    "args": ["--headless", "--disable-gpu", "--no-sandbox"]
-                }),
-            );
-
-            let client = ClientBuilder::native()
-                .capabilities(caps)
-                .connect("http://localhost:4444")
-                .await
-                .wrap_err("failed to connect to WebDriver")?;
-
-            Ok(ChromeTaskCtx { client })
+        let pool = WorkerPool::new(30, 4, move || {
+            let browser = Arc::clone(&browser);
+            async move { ChromeTaskCtx::new(browser).await }
         });
 
-        Self { pool, task_timeout }
+        Ok(Self {
+            pool,
+            _shared_browser: shared_browser,
+            task_timeout,
+        })
     }
 }
 
