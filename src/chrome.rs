@@ -1,16 +1,18 @@
-use std::sync::Arc;
 use std::time::Duration;
+use std::{ops::Deref, sync::Arc};
 
 use chromiumoxide::{
     Page,
     browser::{Browser, BrowserConfig},
     cdp::browser_protocol::page::PrintToPdfParams,
+    page::MediaTypeParams,
 };
 use color_eyre::eyre::{Context, Result, eyre};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
+use crate::wait::{setup_custom_event_wait, wait_for_network_idle};
 use crate::worker::{Task, WorkerPool};
 
 fn format_to_inches(format: &str) -> (f64, f64) {
@@ -145,6 +147,17 @@ impl ChromeTask {
     async fn process_inner(&self, ctx: &mut ChromeTaskCtx) -> Result<Vec<u8>> {
         let p = &self.payload;
 
+        if let Some(media) = &p.media {
+            ctx.page
+                .emulate_media_type(match media.deref() {
+                    "null" => MediaTypeParams::Null,
+                    "screen" => MediaTypeParams::Screen,
+                    "print" => MediaTypeParams::Print,
+                    _ => MediaTypeParams::Null,
+                })
+                .await?;
+        }
+
         // Load content - set_content for HTML (fast!), goto for URLs
         if let Some(html) = &p.html {
             ctx.page
@@ -152,10 +165,31 @@ impl ChromeTask {
                 .await
                 .wrap_err("Failed to set HTML content")?;
         } else if let Some(url) = &p.url {
-            ctx.page
-                .goto(url)
-                .await
-                .wrap_err("Failed to navigate to URL")?;
+            if p.wait_for_event {
+                let wait_future = setup_custom_event_wait(&ctx.page).await?;
+                ctx.page
+                    .goto(url)
+                    .await
+                    .wrap_err("Failed to navigate to URL")?;
+                wait_future.await?;
+            } else {
+                ctx.page
+                    .goto(url)
+                    .await
+                    .wrap_err("Failed to navigate to URL")?;
+
+                match p.wait_for_resources {
+                    Some(true) => {
+                        wait_for_network_idle(&ctx.page, crate::wait::NetworkIdleKind::Idle0)
+                            .await?
+                    }
+                    Some(false) => {
+                        wait_for_network_idle(&ctx.page, crate::wait::NetworkIdleKind::Idle2)
+                            .await?
+                    }
+                    None => {}
+                }
+            }
         } else {
             return Err(eyre!("Either url or html must be provided"));
         }

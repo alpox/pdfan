@@ -12,6 +12,7 @@ use axum::{
 use crate::chrome::{ChromeDriver, ChromeDriverPdfPayload, PdfDriver};
 
 pub mod chrome;
+pub mod wait;
 pub mod worker;
 
 struct AppError(color_eyre::eyre::Error);
