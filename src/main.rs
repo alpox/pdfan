@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
 
     let chrome_driver = Arc::new(
-        ChromeDriver::new(Duration::from_secs(30))
+        ChromeDriver::new(Duration::from_secs(30), 4)
             .await
             .expect("Failed to initialize Chrome driver"),
     );
@@ -44,9 +44,9 @@ async fn main() -> Result<()> {
         .route("/api/convert", post(handle_pdf))
         .with_state(chrome_driver);
 
-    // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    println!("Listening on port 3000");
+    // run our app with hyper, listening globally on port 3001
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await?;
+    println!("Listening on port 3001");
     axum::serve(listener, app).await?;
 
     Ok(())

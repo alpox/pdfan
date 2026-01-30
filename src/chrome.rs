@@ -1,9 +1,10 @@
+use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use std::{ops::Deref, sync::Arc};
 
 use chromiumoxide::{
-    Page,
-    browser::{Browser, BrowserConfig},
+    Browser, Page,
+    browser::BrowserConfig,
     cdp::browser_protocol::page::PrintToPdfParams,
     page::MediaTypeParams,
 };
@@ -66,21 +67,33 @@ pub trait PdfDriver {
     async fn pdf(&self, payload: Self::Payload) -> Result<Vec<u8>>;
 }
 
-/// Shared browser instance with its handler task
-struct SharedBrowser {
-    browser: Arc<Browser>,
+static BROWSER_ID: AtomicUsize = AtomicUsize::new(0);
+
+fn build_browser_config() -> Result<BrowserConfig> {
+    let id = BROWSER_ID.fetch_add(1, Ordering::Relaxed);
+    let user_data_dir = format!("/tmp/pdfan-chrome-{}", id);
+
+    BrowserConfig::builder()
+        .new_headless_mode()
+        .no_sandbox()
+        .arg("--disable-gpu")
+        .arg("--disable-dev-shm-usage")
+        .arg("--disable-frame-rate-limit")
+        .user_data_dir(user_data_dir)
+        .build()
+        .map_err(|e| eyre!("Failed to build browser config: {}", e))
+}
+
+/// Worker context - each worker owns its own browser instance and reusable page
+pub struct ChromeTaskCtx {
+    browser: Browser,
+    page: Page,
     _handler_handle: JoinHandle<()>,
 }
 
-impl SharedBrowser {
-    async fn launch() -> Result<Self> {
-        let config = BrowserConfig::builder()
-            .arg("--headless")
-            .arg("--no-sandbox")
-            .arg("--disable-gpu")
-            .arg("--disable-dev-shm-usage")
-            .build()
-            .map_err(|e| eyre!("Failed to build browser config: {}", e))?;
+impl ChromeTaskCtx {
+    async fn new() -> Result<Self> {
+        let config = build_browser_config()?;
 
         let (browser, mut handler) = Browser::launch(config)
             .await
@@ -95,42 +108,26 @@ impl SharedBrowser {
             }
         });
 
+        // Pre-create a reusable page
+        let page = browser
+            .new_page("about:blank")
+            .await
+            .wrap_err("Failed to create initial page")?;
+
         Ok(Self {
-            browser: Arc::new(browser),
+            browser,
+            page,
             _handler_handle: handler_handle,
         })
     }
 
-    fn browser(&self) -> Arc<Browser> {
-        Arc::clone(&self.browser)
-    }
-}
-
-/// Worker context holding a reusable page
-pub struct ChromeTaskCtx {
-    browser: Arc<Browser>,
-    page: Page,
-}
-
-impl ChromeTaskCtx {
-    async fn new(browser: Arc<Browser>) -> Result<Self> {
-        let page = browser
-            .new_page("about:blank")
-            .await
-            .wrap_err("Failed to create new page")?;
-
-        Ok(Self { browser, page })
-    }
-
     /// Recreate the page if it becomes unusable
     async fn recreate_page(&mut self) -> Result<()> {
-        // Create fresh page (old page will be dropped, which closes it)
         self.page = self
             .browser
             .new_page("about:blank")
             .await
             .wrap_err("Failed to recreate page")?;
-
         Ok(())
     }
 }
@@ -146,6 +143,7 @@ impl ChromeTask {
 
     async fn process_inner(&self, ctx: &mut ChromeTaskCtx) -> Result<Vec<u8>> {
         let p = &self.payload;
+        let total_start = std::time::Instant::now();
 
         if let Some(media) = &p.media {
             ctx.page
@@ -159,6 +157,7 @@ impl ChromeTask {
         }
 
         // Load content - set_content for HTML (fast!), goto for URLs
+        let t1 = std::time::Instant::now();
         if let Some(html) = &p.html {
             ctx.page
                 .set_content(html)
@@ -193,6 +192,7 @@ impl ChromeTask {
         } else {
             return Err(eyre!("Either url or html must be provided"));
         }
+        let nav_time = t1.elapsed();
 
         // Build PDF parameters
         let display_header_footer = p.header_template.is_some() || p.footer_template.is_some();
@@ -229,11 +229,23 @@ impl ChromeTask {
         }
 
         // Generate PDF
+        let t2 = std::time::Instant::now();
         let pdf_bytes = ctx
             .page
             .pdf(pdf_params.build())
             .await
             .wrap_err("Failed to generate PDF")?;
+        let pdf_time = t2.elapsed();
+
+        let total_time = total_start.elapsed();
+
+        // Log slow requests (>200ms)
+        if total_time.as_millis() > 200 {
+            eprintln!(
+                "[SLOW] total={:?} nav={:?} pdf={:?}",
+                total_time, nav_time, pdf_time
+            );
+        }
 
         Ok(pdf_bytes)
     }
@@ -248,7 +260,6 @@ impl Task<ChromeTaskCtx> for ChromeTask {
             Err(e) => {
                 // Attempt recovery by recreating page
                 if ctx.recreate_page().await.is_ok() {
-                    // Retry once with fresh page
                     self.process_inner(ctx).await
                 } else {
                     Err(e)
@@ -260,25 +271,18 @@ impl Task<ChromeTaskCtx> for ChromeTask {
 
 pub struct ChromeDriver {
     pool: WorkerPool<ChromeTaskCtx, ChromeTask>,
-    _shared_browser: SharedBrowser,
     task_timeout: Duration,
 }
 
 impl ChromeDriver {
-    pub async fn new(task_timeout: Duration) -> Result<Self> {
-        let shared_browser = SharedBrowser::launch().await?;
-        let browser = shared_browser.browser();
-
-        let pool = WorkerPool::new(30, 4, move || {
-            let browser = Arc::clone(&browser);
-            async move { ChromeTaskCtx::new(browser).await }
+    /// Create a new ChromeDriver with the specified number of browser instances.
+    /// Each browser is independent, avoiding CDP contention issues.
+    pub async fn new(task_timeout: Duration, num_browsers: usize) -> Result<Self> {
+        let pool = WorkerPool::new(30, num_browsers, || async {
+            ChromeTaskCtx::new().await
         });
 
-        Ok(Self {
-            pool,
-            _shared_browser: shared_browser,
-            task_timeout,
-        })
+        Ok(Self { pool, task_timeout })
     }
 }
 

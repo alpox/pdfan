@@ -5,13 +5,36 @@ use chromiumoxide::{
     Page,
     cdp::browser_protocol::network::{
         EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
-        EventRequestWillBeSent,
+        EventRequestWillBeSent, SetCacheDisabledParams,
     },
+    cdp::browser_protocol::page::EventDomContentEventFired,
     cdp::js_protocol::runtime::EventBindingCalled,
 };
 use color_eyre::eyre::Result;
 use futures::StreamExt;
 use tokio::sync::mpsc;
+
+/// Disable browser cache for consistent performance
+pub async fn disable_cache(page: &Page) -> Result<()> {
+    page.execute(NetworkEnableParams::default()).await?;
+    page.execute(SetCacheDisabledParams::new(true)).await?;
+    Ok(())
+}
+
+/// Set up a listener for DOMContentLoaded event.
+///
+/// Must be called BEFORE navigation (goto). Returns a future that resolves when
+/// DOMContentLoaded fires.
+pub async fn setup_dom_content_loaded_wait(
+    page: &Page,
+) -> Result<impl std::future::Future<Output = Result<()>>> {
+    let mut dom_events = page.event_listener::<EventDomContentEventFired>().await?;
+
+    Ok(async move {
+        dom_events.next().await;
+        Ok(())
+    })
+}
 
 /// Network idle detection strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
